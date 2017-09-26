@@ -18,6 +18,7 @@ import android.hardware.Camera;
 import android.hardware.Camera.PictureCallback;
 import android.hardware.Camera.ShutterCallback;
 import android.os.Bundle;
+import android.os.Environment;
 import android.util.Log;
 import android.util.DisplayMetrics;
 import android.view.GestureDetector;
@@ -34,12 +35,17 @@ import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.RelativeLayout;
 import android.media.ExifInterface;
+import android.net.Uri;
 
 import org.apache.cordova.LOG;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.lang.Exception;
 import java.lang.Integer;
 import java.text.SimpleDateFormat;
@@ -71,6 +77,7 @@ public class CameraActivity extends Fragment {
   private int numberOfCameras;
   private int cameraCurrentlyLocked;
   private int currentQuality;
+  private ExifHelper exifData;            // Exif data from source
 
   // The first rear facing camera
   private int defaultCameraId;
@@ -377,9 +384,141 @@ public class CameraActivity extends Fragment {
     return 0;
   }
 
+  private String getTempDirectoryPath() {
+    File cache = null;
+
+    // SD Card Mounted
+    if (Environment.getExternalStorageState().equals(Environment.MEDIA_MOUNTED)) {
+      cache = getActivity().getExternalCacheDir();
+    }
+    // Use internal storage
+    else {
+      cache = getActivity().getCacheDir();
+    }
+
+    // Create the cache directory if it doesn't exist
+    cache.mkdirs();
+    return cache.getAbsolutePath();
+  }
+
+  /**
+   * Write an inputstream to local disk
+   *
+   * @param fis - The InputStream to write
+   * @param dest - Destination on disk to write to
+   * @throws FileNotFoundException
+   * @throws IOException
+   */
+  private void writeUncompressedImage(InputStream fis, Uri dest) throws FileNotFoundException,
+    IOException {
+    OutputStream os = null;
+    try {
+      os = getActivity().getContentResolver().openOutputStream(dest);
+      byte[] buffer = new byte[4096];
+      int len;
+      while ((len = fis.read(buffer)) != -1) {
+        os.write(buffer, 0, len);
+      }
+      os.flush();
+    } finally {
+      if (os != null) {
+        try {
+          os.close();
+        } catch (IOException e) {
+          LOG.d(TAG, "Exception while closing output stream.");
+        }
+      }
+      if (fis != null) {
+        try {
+          fis.close();
+        } catch (IOException e) {
+          LOG.d(TAG, "Exception while closing file input stream.");
+        }
+      }
+    }
+  }
+
+  /**
+   * Maintain the aspect ratio so the resulting image does not look smooshed
+   *
+   * @param origWidth
+   * @param origHeight
+   * @return
+   */
+  public int[] calculateAspectRatio(int origWidth, int origHeight, int targetWidth, int targetHeight) {
+    int newWidth = targetWidth;
+    int newHeight = targetHeight;
+
+    // If no new width or height were specified return the original bitmap
+    if (newWidth <= 0 && newHeight <= 0) {
+      newWidth = origWidth;
+      newHeight = origHeight;
+    }
+    // Only the width was specified
+    else if (newWidth > 0 && newHeight <= 0) {
+      newHeight = (int)((double)(newWidth / (double)origWidth) * origHeight);
+    }
+    // only the height was specified
+    else if (newWidth <= 0 && newHeight > 0) {
+      newWidth = (int)((double)(newHeight / (double)origHeight) * origWidth);
+    }
+    // If the user specified both a positive width and height
+    // (potentially different aspect ratio) then the width or height is
+    // scaled so that the image fits while maintaining aspect ratio.
+    // Alternatively, the specified width and height could have been
+    // kept and Bitmap.SCALE_TO_FIT specified when scaling, but this
+    // would result in whitespace in the new image.
+    else {
+      double newRatio = newWidth / (double) newHeight;
+      double origRatio = origWidth / (double) origHeight;
+
+      if (origRatio > newRatio) {
+        newHeight = (newWidth * origHeight) / origWidth;
+      } else if (origRatio < newRatio) {
+        newWidth = (newHeight * origWidth) / origHeight;
+      }
+    }
+
+    int[] retval = new int[2];
+    retval[0] = newWidth;
+    retval[1] = newHeight;
+    return retval;
+  }
+
+  /**
+   * Figure out what ratio we can load our image into memory at while still being bigger than
+   * our desired width and height
+   *
+   * @param srcWidth
+   * @param srcHeight
+   * @param dstWidth
+   * @param dstHeight
+   * @return
+   */
+  public static int calculateSampleSize(int srcWidth, int srcHeight, int dstWidth, int dstHeight) {
+    final float srcAspect = (float) srcWidth / (float) srcHeight;
+    final float dstAspect = (float) dstWidth / (float) dstHeight;
+
+    if (srcAspect > dstAspect) {
+      return srcWidth / dstWidth;
+    } else {
+      return srcHeight / dstHeight;
+    }
+  }
+
   PictureCallback jpegPictureCallback = new PictureCallback(){
     public void onPictureTaken(byte[] data, Camera arg1){
       Log.d(TAG, "CameraPreview jpegPictureCallback");
+
+      /*  Copy the inputstream to a temporary file on the device.
+        We then use this temporary file to determine the width/height/orientation.
+        This is the only way to determine the orientation of the photo coming from 3rd party providers (Google Drive, Dropbox,etc)
+        This also ensures we create a scaled bitmap with the correct orientation
+         We delete the temporary file once we are done
+       */
+      File localFile = null;
+      Uri galleryUri = null;
+      int rotate = 0;
 
       try {
         Matrix matrix = new Matrix();
@@ -387,28 +526,30 @@ public class CameraActivity extends Fragment {
           matrix.preScale(1.0f, -1.0f);
         }
 
-        ExifInterface exifInterface = new ExifInterface(new ByteArrayInputStream(data));
-        int rotation = exifInterface.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL);
-        int rotationInDegrees = exifToDegrees(rotation);
+        ByteArrayInputStream fileStream = new ByteArrayInputStream(data);
+        if (fileStream != null) {
+          // Generate a temporary file
+          String timeStamp = new SimpleDateFormat("yyyyMMdd_HHmmss").format(new Date());
+          String fileName = "IMG_" + timeStamp + ".jpg";
+          localFile = new File(getTempDirectoryPath() + fileName);
+          galleryUri = Uri.fromFile(localFile);
+          writeUncompressedImage(fileStream, galleryUri);
 
-        if (rotation != 0f) {
-          matrix.preRotate(rotationInDegrees);
+          try {
+            //  ExifInterface doesn't like the file:// prefix
+            String filePath = galleryUri.toString().replace("file://", "");
+            // read exifData of source
+            exifData = new ExifHelper();
+            exifData.createInFile(filePath);
+            // Use ExifInterface to pull rotation information
+            ExifInterface exif = new ExifInterface(filePath);
+            rotate = exifToDegrees(exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_UNDEFINED));
+          } catch (Exception oe) {
+            LOG.w(TAG,"Unable to read Exif data: "+ oe.toString());
+            rotate = 0;
+          }
+
         }
-
-        // Check if matrix has changed. In that case, apply matrix and override data
-        if (!matrix.isIdentity()) {
-          Bitmap bitmap = BitmapFactory.decodeByteArray(data, 0, data.length);
-          bitmap = applyMatrix(bitmap, matrix);
-
-          ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-          bitmap.compress(Bitmap.CompressFormat.JPEG, currentQuality, outputStream);
-          data = outputStream.toByteArray();
-        }
-
-        String encodedImage = Base64.encodeToString(data, Base64.NO_WRAP);
-
-        eventListener.onPictureTaken(encodedImage);
-        Log.d(TAG, "CameraPreview pictureTakenHandler called back");
       } catch (OutOfMemoryError e) {
         // most likely failed to allocate memory for rotateBitmap
         Log.d(TAG, "CameraPreview OutOfMemoryError");
@@ -419,10 +560,110 @@ public class CameraActivity extends Fragment {
         eventListener.onPictureTakenError("IO Error when extracting exif");
       } catch (Exception e) {
         Log.d(TAG, "CameraPreview onPictureTaken general exception");
+      }
+
+      try {
+
+        // figure out the original width and height of the image
+        BitmapFactory.Options options = new BitmapFactory.Options();
+        options.inJustDecodeBounds = true;
+        InputStream fileStream = null;
+        try {
+          fileStream = FileHelper.getInputStreamFromUriString(galleryUri.toString(), getActivity());
+          BitmapFactory.decodeStream(fileStream, null, options);
+        } finally {
+          if (fileStream != null) {
+            try {
+              fileStream.close();
+            } catch (IOException e) {
+              LOG.d(TAG, "Exception while closing file input stream.");
+            }
+          }
+        }
+
+        if (options.outWidth == 0 || options.outHeight == 0) {
+          return;
+        }
+
+        // User didn't specify output dimensions, but they need orientation
+//        if (this.targetWidth <= 0 && this.targetHeight <= 0) {
+//          this.targetWidth = options.outWidth;
+//          this.targetHeight = options.outHeight;
+//        }
+
+        // Setup target width/height based on orientation
+        int rotatedWidth, rotatedHeight;
+        boolean rotated = false;
+        if (rotate == 90 || rotate == 270) {
+          rotatedWidth = options.outHeight;
+          rotatedHeight = options.outWidth;
+          rotated = true;
+        } else {
+          rotatedWidth = options.outWidth;
+          rotatedHeight = options.outHeight;
+        }
+
+        // determine the correct aspect ratio
+        int[] widthHeight = calculateAspectRatio(rotatedWidth, rotatedHeight, rotatedWidth, rotatedHeight);
+
+
+        // Load in the smallest bitmap possible that is closest to the size we want
+        options.inJustDecodeBounds = false;
+        options.inSampleSize = calculateSampleSize(rotatedWidth, rotatedHeight, widthHeight[0], widthHeight[1]);
+        Bitmap unscaledBitmap = null;
+        try {
+          fileStream = FileHelper.getInputStreamFromUriString(galleryUri.toString(), getActivity());
+          unscaledBitmap = BitmapFactory.decodeStream(fileStream, null, options);
+        } finally {
+          if (fileStream != null) {
+            try {
+              fileStream.close();
+            } catch (IOException e) {
+              LOG.d(TAG, "Exception while closing file input stream.");
+            }
+          }
+        }
+        if (unscaledBitmap == null) {
+          return;
+        }
+
+        int scaledWidth = (!rotated) ? widthHeight[0] : widthHeight[1];
+        int scaledHeight = (!rotated) ? widthHeight[1] : widthHeight[0];
+
+        Bitmap scaledBitmap = Bitmap.createScaledBitmap(unscaledBitmap, scaledWidth, scaledHeight, true);
+        if (scaledBitmap != unscaledBitmap) {
+          unscaledBitmap.recycle();
+          unscaledBitmap = null;
+        }
+        if ((rotate != 0)) {
+          Matrix matrix = new Matrix();
+          matrix.setRotate(rotate);
+          scaledBitmap = Bitmap.createBitmap(scaledBitmap, 0, 0, scaledBitmap.getWidth(), scaledBitmap.getHeight(), matrix, true);
+        }
+
+        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        scaledBitmap.compress(Bitmap.CompressFormat.JPEG, currentQuality, outputStream);
+        data = outputStream.toByteArray();
+        String encodedImage = Base64.encodeToString(data, Base64.NO_WRAP);
+        eventListener.onPictureTaken(encodedImage);
+
+        Log.d(TAG, "CameraPreview pictureTakenHandler called back");
+      } catch (IOException e) {
+        Log.d(TAG, "CameraPreview IOExceptions");
+        eventListener.onPictureTakenError("IO Error when extracting exif");
+      } catch (OutOfMemoryError oom) {
+        Log.d(TAG, "CameraPreview OutOfMemoryError 2");
+        eventListener.onPictureTakenError("Picture too large (memory)");
       } finally {
+        //Delete temp file used during rotation
+        if (localFile != null) {
+          localFile.delete();
+        }
+
         canTakePicture = true;
         mCamera.startPreview();
       }
+
     }
   };
 
